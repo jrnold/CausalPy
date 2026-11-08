@@ -31,6 +31,10 @@ Permissible cells are control units at every time, and each treated unit strictl
 
 Shared factors and shared time intercepts are informed by the control panel only. The control likelihood uses the one shared positive residual scale, not a unit observation scale. That is one random variable. Treated pre-period outcomes may update that scale's draws after the factor and time-intercept sample, and must not resample those draws. Loadings use the updated draws. The factor posterior is the control-panel posterior under that scale as informed by the control panel. It is not recomputed under the treated-pre update. There is one residual scale, not two, and the caller does not supply it.
 
+## Computation
+
+Given the shared factors, time intercepts, factor scales, and residual scale, each control unit's series is Gaussian with its unit intercept and loadings integrated out: covariance $\sigma^2 I + W D W^\top$ with $W = [\mathbf{1}, F]$ and $D$ the prior variances of the intercept and loadings. The control likelihood uses that marginal density, evaluated with the Woodbury identity so each unit costs one small Cholesky factorization. NUTS therefore samples only the shared terms. This changes the computation, not the posterior: the control intercepts and loadings are then drawn exactly from their Gaussian conditional, one draw per posterior draw. Treated intercepts and loadings are drawn exactly from the same kind of conditional at the updated residual scale, without a second Markov chain.
+
 ## Shrinkage, not a selected rank
 
 v1 fits one factor model with a fixed upper bound `max_factors` and a multiplicative gamma process on the factor scales (Bhattacharya and Dunson). There is one positive scale per factor. Later factors are shrunk at least as hard, in the prior, as earlier ones, and unused scales can go to zero. Posterior intervals for the untreated trajectory marginalize that prior. They are not conditional on a chosen rank.

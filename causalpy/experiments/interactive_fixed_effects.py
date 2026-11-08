@@ -29,6 +29,8 @@ updated draws. The factor posterior is the control-panel posterior under that
 scale as informed by the control panel. It is not recomputed under the
 treated-pre update. Treated post-intervention outcomes never enter the
 likelihood.
+
+The control unit intercepts and loadings are integrated out of the control likelihood, which is exact for this Gaussian model. NUTS samples only the shared terms, and the integrated terms are drawn exactly from their Gaussian conditional after sampling. Treated intercepts and loadings are drawn the same way, at the updated scale, one draw per control-panel draw.
 """
 
 from __future__ import annotations
@@ -42,6 +44,7 @@ import pymc as pm
 import pytensor.tensor as pt
 import xarray as xr
 from matplotlib import pyplot as plt
+from pytensor.tensor.linalg import solve_triangular
 
 from causalpy.constants import HDI_PROB
 from causalpy.date_utils import validate_treatment_time_against_index
@@ -197,13 +200,7 @@ class InteractiveFixedEffectsSyntheticControl:
         """Sample the joint posterior and populate :attr:`result`.
 
         Keyword arguments are forwarded to the control-panel :func:`pymc.sample`
-        call. The treated conditional sample is aligned to those draws: one
-        conditional draw per control-panel draw. Before that sample, the one
-        shared residual scale's draws are updated from treated pre-period
-        outcomes. The conditional sample uses those updated draws as the
-        loading likelihood scale. It does not resample the scale, the factors,
-        or the time intercepts, and it does not take caller-supplied factor
-        draws.
+        call. That sample integrates out the control intercepts and loadings; they are then drawn exactly, one per control-panel draw. The treated conditional draws are aligned the same way. Before they are drawn, the one shared residual scale's draws are updated from treated pre-period outcomes. The treated intercepts and loadings are drawn exactly from their Gaussian conditional at those updated draws. This does not resample the scale, the factors, or the time intercepts, and it does not take caller-supplied factor draws.
 
         Treated post-intervention outcomes are read only when impacts are
         aligned, after sampling. Changing them does not change the untreated
@@ -245,14 +242,13 @@ class InteractiveFixedEffectsSyntheticControl:
             initvals=_control_initvals(self._control_model, self._control_outcomes()),
             **sample_kwargs,
         )
-        conditional = _sample_treated_conditional(
-            self._control_outcomes(),
-            self.panel.treated_pre,
-            _as_dataset(control_idata),
-            random_seed=None if random_seed is None else random_seed + 1,
-            progressbar=progressbar,
+        rng = np.random.default_rng(None if random_seed is None else random_seed + 1)
+        posterior = _with_control_draws(
+            _as_dataset(control_idata), self._control_outcomes(), rng
         )
-        posterior = _as_dataset(control_idata)
+        conditional = _sample_treated_conditional(
+            self._control_outcomes(), self.panel.treated_pre, posterior, rng=rng
+        )
         self.result = self.compose_result(
             unit_intercept=conditional["unit_intercept"],
             time_intercept=posterior["time_intercept"],
@@ -528,8 +524,119 @@ def _control_outcome_spread(control_y: xr.DataArray) -> float:
     return float(max(np.sqrt(np.mean(centered**2)), _MIN_OUTCOME_SPREAD))
 
 
+def _marginal_unit_logp(
+    value: pt.TensorVariable,
+    time_intercept: pt.TensorVariable,
+    factors: pt.TensorVariable,
+    shrinkage: pt.TensorVariable,
+    sigma: pt.TensorVariable,
+) -> pt.TensorVariable:
+    """Log density of one unit's series with its intercept and loadings integrated out.
+
+    Given the time intercepts, factors, factor scales, and residual scale, a unit's series is Gaussian: ``y = xi + W b + e`` with ``W = [1, F]``, ``b ~ N(0, D)`` and ``D = diag(_INTERCEPT_SD**2, shrinkage**2)``. The covariance ``sigma**2 I + W D W'`` is handled with the Woodbury identity and the matrix determinant lemma, so each unit costs one ``(max_factors + 1)``-square Cholesky. Leading dimensions of ``value`` are units.
+    """
+    centered = value - time_intercept
+    batch = tuple(centered.shape[:-1])
+    n_time = centered.shape[-1]
+    n_factors = factors.shape[-1]
+    factor_b = pt.broadcast_to(factors, (*batch, *factors.shape[-2:]))
+    scale_b = pt.broadcast_to(shrinkage, (*batch, n_factors))
+    variance = pt.broadcast_to(sigma, batch) ** 2
+    design = pt.concatenate([pt.ones((*batch, n_time, 1)), factor_b], axis=-1)
+    prior_var = pt.concatenate(
+        [pt.full((*batch, 1), _INTERCEPT_SD**2), scale_b**2], axis=-1
+    )
+    design_t = pt.matrix_transpose(design)
+    precision = (
+        pt.eye(n_factors + 1) / prior_var[..., None, :]
+        + design_t @ design / variance[..., None, None]
+    )
+    chol = pt.linalg.cholesky(precision)
+    whitened = solve_triangular(
+        chol, design_t @ centered[..., None], lower=True, b_ndim=2
+    )[..., 0]
+    quadratic = (
+        pt.sum(centered**2, axis=-1) / variance
+        - pt.sum(whitened**2, axis=-1) / variance**2
+    )
+    logdet = (
+        n_time * pt.log(variance)
+        + pt.sum(pt.log(prior_var), axis=-1)
+        + 2.0 * pt.sum(pt.log(pt.diagonal(chol, axis1=-2, axis2=-1)), axis=-1)
+    )
+    return -0.5 * (n_time * np.log(2.0 * np.pi) + logdet + quadratic)
+
+
+def _marginal_unit_random(
+    time_intercept: np.ndarray,
+    factors: np.ndarray,
+    shrinkage: np.ndarray,
+    sigma: np.ndarray,
+    rng: np.random.Generator | None = None,
+    size: tuple[int, ...] | None = None,
+) -> np.ndarray:
+    """Draw unit series from the generative model behind :func:`_marginal_unit_logp`."""
+    rng = np.random.default_rng() if rng is None else rng
+    time_intercept, factors, shrinkage, sigma = (
+        np.asarray(a, dtype=float) for a in (time_intercept, factors, shrinkage, sigma)
+    )
+    shape = (
+        tuple(size)
+        if size is not None
+        else np.broadcast_shapes(
+            time_intercept.shape[:-1],
+            factors.shape[:-2],
+            shrinkage.shape[:-1],
+            sigma.shape,
+        )
+    )
+    n_time, n_factors = factors.shape[-2:]
+    intercept = rng.normal(0.0, _INTERCEPT_SD, size=(*shape, 1))
+    loadings = rng.normal(size=(*shape, n_factors)) * np.broadcast_to(
+        shrinkage, (*shape, n_factors)
+    )
+    product = np.einsum(
+        "...tk,...k->...t",
+        np.broadcast_to(factors, (*shape, n_time, n_factors)),
+        loadings,
+    )
+    noise = rng.normal(size=(*shape, n_time)) * np.broadcast_to(sigma, shape)[..., None]
+    return time_intercept + intercept + product + noise
+
+
+def _conjugate_unit_draws(
+    centered: np.ndarray,
+    factors: np.ndarray,
+    shrinkage: np.ndarray,
+    scale: np.ndarray,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Exact draws of each unit's intercept and loadings from their Gaussian conditional.
+
+    ``centered`` is ``(sample, time, unit)`` outcomes minus time intercepts, ``factors`` is ``(sample, time, factor)``, ``shrinkage`` is ``(sample, factor)``, and ``scale`` is ``(sample,)``. Returns ``(sample, unit, factor + 1)``; column 0 is the intercept. The conditional is ``N(V W' y / s**2, V)`` with ``V = (D^-1 + W'W / s**2)^-1``.
+    """
+    n_sample, n_time, n_unit = centered.shape
+    design = np.concatenate([np.ones((n_sample, n_time, 1)), factors], axis=-1)
+    prior_var = np.concatenate(
+        [np.full((n_sample, 1), _INTERCEPT_SD**2), shrinkage**2], axis=-1
+    )
+    variance = scale**2
+    design_t = np.swapaxes(design, -1, -2)
+    precision = (
+        np.eye(design.shape[-1]) / prior_var[:, None, :]
+        + design_t @ design / variance[:, None, None]
+    )
+    chol = np.linalg.cholesky(precision)
+    mean = np.linalg.solve(precision, design_t @ centered) / variance[:, None, None]
+    noise = rng.standard_normal(mean.shape)
+    draws = mean + np.linalg.solve(np.swapaxes(chol, -1, -2), noise)
+    return np.swapaxes(draws, -1, -2)
+
+
 def _control_model(control_y: xr.DataArray, max_factors: int) -> pm.Model:
     """Gaussian factor graph on control cells only.
+
+    Control unit intercepts and loadings are integrated out of the likelihood (:func:`_marginal_unit_logp`), so NUTS samples only the shared factors, time intercepts, factor scales, and residual scale. :func:`_with_control_draws` draws the integrated terms exactly after sampling.
 
     The likelihood uses the one shared positive residual scale. That scale is
     bounded below by a fraction of the control-panel outcome spread, so a
@@ -555,32 +662,22 @@ def _control_model(control_y: xr.DataArray, max_factors: int) -> pm.Model:
         sigma = pm.Deterministic(
             "sigma", spread * (_RESIDUAL_FLOOR_FRACTION + sigma_raw)
         )
-        unit_intercept = pm.Normal(
-            "control_unit_intercept", 0.0, _INTERCEPT_SD, dims="control_units"
-        )
         time_intercept = pm.Normal("time_intercept", 0.0, _INTERCEPT_SD, dims="obs_ind")
         shared_factors = pm.Normal(
             "shared_factors", 0.0, 1.0, dims=("obs_ind", "factors")
         )
-        shrinkage = model["shrinkage_state"]
-        loadings = pm.Normal(
-            "control_loadings",
-            0.0,
-            shrinkage,
-            dims=("control_units", "factors"),
-        )
-        product = pt.sum(
-            loadings.dimshuffle("x", 0, 1) * shared_factors.dimshuffle(0, "x", 1),
-            axis=2,
-        )
-        mu = unit_intercept + time_intercept.dimshuffle(0, "x") + product
-        observed = control_y.transpose("obs_ind", "control_units")
-        pm.Normal(
+        observed = control_y.transpose("control_units", "obs_ind")
+        pm.CustomDist(
             "control_y",
-            mu,
+            time_intercept,
+            shared_factors,
+            model["shrinkage_state"],
             sigma,
+            logp=_marginal_unit_logp,
+            random=_marginal_unit_random,
+            signature="(t),(t,k),(k),()->(t)",
             observed=observed.values,
-            dims=("obs_ind", "control_units"),
+            dims=("control_units", "obs_ind"),
         )
     return model
 
@@ -595,14 +692,11 @@ def _control_initvals(
     n_factors = int(model.dim_lengths["factors"].eval())
     rank = min(n_factors, left.shape[1])
     factors = np.zeros((values.shape[0], n_factors))
-    loadings = np.zeros((values.shape[1], n_factors))
     if rank:
         scale = np.sqrt(np.maximum(singular[:rank], 1e-8))
         factors[:, :rank] = left[:, :rank] * scale
-        loadings[:, :rank] = right[:rank, :].T * scale
     return {
         "shared_factors": factors,
-        "control_loadings": loadings,
         "mgp_delta": np.array([1.0 if i == 0 else 1.5 for i in range(n_factors)]),
         "sigma_raw": np.array(1.0),
     }
@@ -722,21 +816,51 @@ def _updated_residual_scale(
     return updated
 
 
+def _with_control_draws(
+    posterior: xr.Dataset, control_y: xr.DataArray, rng: np.random.Generator
+) -> xr.Dataset:
+    """Add exact draws of the integrated control intercepts and loadings.
+
+    The control graph integrates these terms out. One draw per posterior draw comes from their Gaussian conditional given that draw's factors, time intercepts, factor scales, and residual scale. They feed the control residual sum of squares used by the treated-pre scale update.
+    """
+    stacked = posterior.stack(sample=_DRAW_DIMS)
+    factors = stacked["shared_factors"].transpose("sample", "obs_ind", "factors")
+    centered = control_y - stacked["time_intercept"]
+    draws = _conjugate_unit_draws(
+        centered.transpose("sample", "obs_ind", "control_units").values,
+        factors.values,
+        stacked["shrinkage_state"].transpose("sample", "factors").values,
+        np.asarray(stacked["sigma"].transpose("sample").values, dtype=float),
+        rng,
+    )
+    sample = stacked.indexes["sample"]
+    units = control_y.coords["control_units"].values
+    intercept = xr.DataArray(
+        draws[..., 0],
+        dims=("sample", "control_units"),
+        coords={"control_units": units},
+    )
+    loadings = xr.DataArray(
+        draws[..., 1:],
+        dims=("sample", "control_units", "factors"),
+        coords={"control_units": units, "factors": factors.coords["factors"].values},
+    )
+    return posterior.assign(
+        control_unit_intercept=_restore_draws(intercept, sample),
+        control_loadings=_restore_draws(loadings, sample),
+    )
+
+
 def _sample_treated_conditional(
     control_y: xr.DataArray,
     treated_pre: xr.DataArray,
     control_posterior: xr.Dataset,
     *,
-    random_seed: int | None,
-    progressbar: bool,
+    rng: np.random.Generator,
 ) -> dict[str, xr.DataArray]:
-    """Sample treated intercepts and loadings at the updated residual scale.
+    """Draw treated intercepts and loadings exactly at the updated residual scale.
 
-    Factors and time intercepts are data from the control-panel posterior.
-    The one shared residual scale is not a random variable here: its draws are
-    updated from treated pre-period outcomes, then held fixed. Loadings use
-    those updated draws. Treated pre-period outcomes cannot move the factor or
-    time-intercept draws.
+    Factors and time intercepts are data from the control-panel posterior. The one shared residual scale is not a random variable here: its draws are updated from treated pre-period outcomes, then held fixed. Given those, the treated intercepts and loadings have a Gaussian conditional, drawn exactly with one draw per control-panel draw (:func:`_conjugate_unit_draws`). Treated pre-period outcomes cannot move the factor or time-intercept draws.
     """
     posterior = _as_dataset(control_posterior)
     stacked = posterior.stack(sample=_DRAW_DIMS)
@@ -758,74 +882,38 @@ def _sample_treated_conditional(
     xi_pre = time_intercept.sel(obs_ind=pre_times).transpose("sample", "obs_ind").values
     treated_values = treated_pre.transpose("obs_ind", "treated_units").values
     treated_centered = treated_values[None, :, :] - xi_pre[:, :, None]
+    shrinkage_values = np.asarray(shrinkage.values, dtype=float)
     updated_scale = _updated_residual_scale(
         np.asarray(stacked["sigma"].values, dtype=float),
         np.asarray(control_rss, dtype=float),
         n_control,
         factor_pre,
-        np.asarray(shrinkage.values, dtype=float),
+        shrinkage_values,
         treated_centered,
         spread=_control_outcome_spread(control_y),
     )
-    treated_observed = np.broadcast_to(
-        treated_values,
-        (
-            factors.sizes["sample"],
-            treated_pre.sizes["obs_ind"],
-            treated_pre.sizes["treated_units"],
-        ),
-    ).copy()
-    with pm.Model(
-        coords={
-            "sample": factors.coords["sample"].values,
-            "treated_units": treated_pre.coords["treated_units"].values,
-            "factors": factors.coords["factors"].values,
-        }
-    ) as model:
-        residual_scale = pm.Data("residual_scale", updated_scale, dims="sample")
-        scale = residual_scale.dimshuffle(0, "x", "x")
-        unit_intercept = pm.Normal(
-            "unit_intercept",
-            0.0,
-            _INTERCEPT_SD,
-            dims=("sample", "treated_units"),
-        )
-        shrink = np.broadcast_to(
-            shrinkage.values[:, None, :],
-            (
-                factors.sizes["sample"],
-                treated_pre.sizes["treated_units"],
-                factors.sizes["factors"],
-            ),
-        ).copy()
-        loadings = pm.Normal(
-            "loadings",
-            0.0,
-            shrink,
-            dims=("sample", "treated_units", "factors"),
-        )
-        mu = (
-            unit_intercept.dimshuffle(0, "x", 1)
-            + xi_pre[:, :, None]
-            + pt.sum(
-                loadings.dimshuffle(0, "x", 1, 2) * factor_pre[:, :, None, :], axis=3
-            )
-        )
-        pm.Normal("treated_pre", mu, scale, observed=treated_observed)
-        idata = pm.sample(
-            draws=1,
-            tune=40,
-            chains=1,
-            cores=1,
-            random_seed=random_seed,
-            progressbar=progressbar,
-            model=model,
-            compute_convergence_checks=False,
-        )
-    drawn = _as_dataset(idata).isel(chain=0, draw=-1)
+    draws = _conjugate_unit_draws(
+        treated_centered, factor_pre, shrinkage_values, updated_scale, rng
+    )
+    coords = {
+        "sample": stacked.coords["sample"].values,
+        "treated_units": treated_pre.coords["treated_units"].values,
+    }
+    intercept = xr.DataArray(
+        draws[..., 0], dims=("sample", "treated_units"), coords=coords
+    )
+    loadings = xr.DataArray(
+        draws[..., 1:],
+        dims=("sample", "treated_units", "factors"),
+        coords={**coords, "factors": factors.coords["factors"].values},
+    )
+    scale = xr.DataArray(
+        updated_scale, dims=("sample",), coords={"sample": coords["sample"]}
+    )
     return {
-        "unit_intercept": _restore_draws(drawn["unit_intercept"], draw_index),
-        "loadings": _restore_draws(drawn["loadings"], draw_index),
+        "unit_intercept": _restore_draws(intercept, draw_index),
+        "loadings": _restore_draws(loadings, draw_index),
+        "residual_scale": _restore_draws(scale, draw_index),
     }
 
 

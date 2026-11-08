@@ -21,17 +21,21 @@ from unittest.mock import patch
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import pymc as pm
 import pytest
 import xarray as xr
 
 from causalpy.experiments._results import CausalResult
 from causalpy.experiments.interactive_fixed_effects import (
+    _INTERCEPT_SD,
     _RESIDUAL_FLOOR_FRACTION,
     InteractiveFixedEffectsResult,
     InteractiveFixedEffectsSyntheticControl,
     _as_dataset,
+    _conjugate_unit_draws,
     _control_initvals,
     _control_outcome_spread,
+    _marginal_unit_logp,
     _scale_log_posterior,
     _updated_residual_scale,
     untreated_counterfactual,
@@ -182,9 +186,9 @@ def test_control_graph_excludes_treated_post_outcomes() -> None:
     model = experiment._control_model
     assert model is not None
     observed = model.rvs_to_values[model["control_y"]].eval()
-    assert observed.shape == (4, 2)
+    assert observed.shape == (2, 4)
     assert not np.any(observed == 12345.0)
-    np.testing.assert_allclose(observed[:, 0], frame["donor_a"].to_numpy())
+    np.testing.assert_allclose(observed[0], frame["donor_a"].to_numpy())
 
 
 def test_treated_pre_updates_scale_not_factors_or_time_intercepts(monkeypatch) -> None:
@@ -210,14 +214,22 @@ def test_treated_pre_updates_scale_not_factors_or_time_intercepts(monkeypatch) -
         shifted.index[shifted.index < panel.treatment_time][0], panel.treated_units[0]
     ] = 12345.0
     captured: list[tuple] = []
+    conditionals: list[dict] = []
     real_sample = ife.pm.sample
+    real_conditional = ife._sample_treated_conditional
 
     def spy(*args, **kwargs):
         idata = real_sample(*args, **kwargs)
         captured.append((kwargs["model"], idata))
         return idata
 
+    def spy_conditional(*args, **kwargs):
+        out = real_conditional(*args, **kwargs)
+        conditionals.append(out)
+        return out
+
     monkeypatch.setattr(ife.pm, "sample", spy)
+    monkeypatch.setattr(ife, "_sample_treated_conditional", spy_conditional)
 
     def fit(frame):
         return ife.InteractiveFixedEffectsSyntheticControl(
@@ -230,18 +242,17 @@ def test_treated_pre_updates_scale_not_factors_or_time_intercepts(monkeypatch) -
 
     fit(baseline_frame)
     fit(shifted)
-    assert len(captured) == 4
-    base_control, base_conditional = captured[0], captured[1]
-    moved_control, moved_conditional = captured[2], captured[3]
+    # One MCMC run per fit: the control panel. Treated draws are closed form.
+    assert len(captured) == 2
+    assert len(conditionals) == 2
+    base_control, moved_control = captured
 
-    def assert_split(control_model, conditional_model, frame) -> None:
+    def assert_control(control_model) -> None:
         assert {rv.name for rv in control_model.free_RVs} == {
             "mgp_delta",
             "sigma_raw",
-            "control_unit_intercept",
             "time_intercept",
             "shared_factors",
-            "control_loadings",
         }
         sigma = control_model["sigma"]
         assert sigma in set(ancestors([control_model["control_y"]]))
@@ -249,39 +260,15 @@ def test_treated_pre_updates_scale_not_factors_or_time_intercepts(monkeypatch) -
         control_observed = control_model.rvs_to_values[
             control_model["control_y"]
         ].eval()
-        assert control_observed.shape[1] == len(panel.control_units)
+        assert control_observed.shape[0] == len(panel.control_units)
         assert not np.any(control_observed == 12345.0)
-        treated_pre = frame.loc[
-            frame.index < panel.treatment_time, list(panel.treated_units)
+        treated_pre = shifted.loc[
+            shifted.index < panel.treatment_time, list(panel.treated_units)
         ]
         assert not np.any(np.isin(control_observed, treated_pre.to_numpy()))
-        assert {rv.name for rv in conditional_model.free_RVs} == {
-            "unit_intercept",
-            "loadings",
-        }
-        assert "sigma" not in conditional_model.named_vars
-        treated = conditional_model["treated_pre"]
-        treated_ancestors = set(ancestors([treated]))
-        assert conditional_model["residual_scale"] in treated_ancestors
-        assert [
-            rv.name
-            for rv in conditional_model.free_RVs
-            if rv in treated_ancestors and rv.name not in {"unit_intercept", "loadings"}
-        ] == []
-        assert {rv.name for rv in conditional_model.observed_RVs} == {"treated_pre"}
-        assert "shared_factors" not in conditional_model.named_vars
-        assert "time_intercept" not in conditional_model.named_vars
-        scale = np.asarray(conditional_model["residual_scale"].eval())
-        assert scale.ndim == 1
-        assert not np.allclose(scale, 1.0)
-        treated_observed = conditional_model.rvs_to_values[treated].eval()
-        if frame is baseline_frame:
-            assert not np.any(treated_observed == 12345.0)
-        else:
-            assert np.any(treated_observed == 12345.0)
 
-    assert_split(base_control[0], base_conditional[0], baseline_frame)
-    assert_split(moved_control[0], moved_conditional[0], shifted)
+    assert_control(base_control[0])
+    assert_control(moved_control[0])
 
     base_posterior = ife._as_dataset(base_control[1])
     moved_posterior = ife._as_dataset(moved_control[1])
@@ -295,8 +282,11 @@ def test_treated_pre_updates_scale_not_factors_or_time_intercepts(monkeypatch) -
         base_posterior["shrinkage_state"], moved_posterior["shrinkage_state"]
     )
     xr.testing.assert_allclose(base_posterior["sigma"], moved_posterior["sigma"])
-    base_scale = np.asarray(base_conditional[0]["residual_scale"].eval())
-    moved_scale = np.asarray(moved_conditional[0]["residual_scale"].eval())
+    base_scale = conditionals[0]["residual_scale"].values
+    moved_scale = conditionals[1]["residual_scale"].values
+    assert base_scale.shape == base_posterior["sigma"].shape
+    # The loading scale is the treated-pre update, not the control-panel draw.
+    assert not np.allclose(moved_scale, moved_posterior["sigma"].values)
     assert float(np.mean(moved_scale)) > float(np.mean(base_scale)) + 1.0
 
 
@@ -367,7 +357,7 @@ def test_donor_order_changes_observed_columns_not_the_treated_post_cells() -> No
     assert forward_model is not None and backward_model is not None
     forward_y = forward_model.rvs_to_values[forward_model["control_y"]].eval()
     backward_y = backward_model.rvs_to_values[backward_model["control_y"]].eval()
-    np.testing.assert_allclose(forward_y, np.flip(backward_y, axis=1))
+    np.testing.assert_allclose(forward_y, np.flip(backward_y, axis=0))
     treated_post = panel.data.loc[
         panel.data.index >= panel.treatment_time, "treated"
     ].iloc[0]
@@ -546,7 +536,7 @@ def test_control_initvals_skip_the_svd_fill_when_the_factor_axis_is_empty() -> N
     )
     start = _control_initvals(_Model(), control_y)
     assert start["shared_factors"].shape == (3, 0)
-    assert start["control_loadings"].shape == (2, 0)
+    assert "control_loadings" not in start
     assert start["mgp_delta"].shape == (0,)
 
 
@@ -718,3 +708,67 @@ def test_control_posterior_coercion_accepts_a_mapping_and_rejects_other_objects(
         _as_dataset(object())
     with pytest.raises(TypeError, match="control posterior"):
         _as_dataset(_Holder(object()))
+
+
+def _dense_unit_logp(y, xi, factors, shrinkage, sigma):
+    from scipy import stats
+
+    n_time = len(xi)
+    covariance = (
+        sigma**2 * np.eye(n_time)
+        + _INTERCEPT_SD**2 * np.ones((n_time, n_time))
+        + factors @ np.diag(shrinkage**2) @ factors.T
+    )
+    return np.array(
+        [stats.multivariate_normal(xi, covariance).logpdf(row) for row in y]
+    )
+
+
+def test_marginal_control_logp_matches_dense_gaussian() -> None:
+    """Integrating out control intercepts and loadings is exact, not approximate."""
+    rng = np.random.default_rng(11)
+    n_unit, n_time, n_factor = 4, 6, 3
+    y = rng.normal(size=(n_unit, n_time))
+    xi = rng.normal(size=n_time)
+    factors = rng.normal(size=(n_time, n_factor))
+    shrinkage = np.array([0.9, 0.3, 0.05])
+    sigma = 0.4
+    marginal = _marginal_unit_logp(y, xi, factors, shrinkage, np.asarray(sigma)).eval()
+    np.testing.assert_allclose(
+        marginal, _dense_unit_logp(y, xi, factors, shrinkage, sigma), rtol=1e-8
+    )
+
+
+def test_marginal_control_graph_supports_prior_predictive() -> None:
+    experiment = _experiment()
+    experiment.build()
+    with experiment._control_model:
+        prior = pm.sample_prior_predictive(draws=5, random_seed=3)
+    draws = _as_dataset(prior["prior_predictive"])["control_y"]
+    assert draws.sizes["control_units"] == 2
+    assert draws.sizes["obs_ind"] == 4
+    assert np.all(np.isfinite(draws.values))
+
+
+def test_conjugate_unit_draws_match_the_gaussian_conditional() -> None:
+    """Exact loading draws have the closed-form conditional mean and covariance."""
+    rng = np.random.default_rng(5)
+    n_time, n_factor = 8, 2
+    factors = rng.normal(size=(n_time, n_factor))
+    shrinkage = np.array([1.0, 0.5])
+    scale = 0.7
+    centered = rng.normal(size=(n_time, 1))
+    n_sample = 40000
+    draws = _conjugate_unit_draws(
+        np.broadcast_to(centered, (n_sample, n_time, 1)).copy(),
+        np.broadcast_to(factors, (n_sample, n_time, n_factor)).copy(),
+        np.broadcast_to(shrinkage, (n_sample, n_factor)).copy(),
+        np.full(n_sample, scale),
+        np.random.default_rng(6),
+    )[:, 0, :]
+    design = np.column_stack([np.ones(n_time), factors])
+    prior = np.diag(np.concatenate([[_INTERCEPT_SD**2], shrinkage**2]))
+    covariance = np.linalg.inv(np.linalg.inv(prior) + design.T @ design / scale**2)
+    mean = covariance @ design.T @ centered[:, 0] / scale**2
+    np.testing.assert_allclose(draws.mean(0), mean, atol=0.03)
+    np.testing.assert_allclose(np.cov(draws.T), covariance, atol=0.03)
